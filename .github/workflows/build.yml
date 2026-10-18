@@ -1,0 +1,86 @@
+name: Build charts
+# Builds the Rijkswaterstaat inland ENC into PMTiles with the OpenSail chart pipeline
+# and publishes it as a release. The newest release is what the apps read:
+#   https://github.com/gjvanhalem/opensail-charts/releases/latest/download/index.json
+on:
+  workflow_dispatch:
+    inputs:
+      file_id:
+        description: 'Rijkswaterstaat download file id (empty: the newest "Nederland (excl. Zeeland, Waddenzee)")'
+        required: false
+        default: ''
+      force:
+        description: 'Publish even if the newest release was built from the same file id'
+        type: boolean
+        default: false
+  schedule:
+    # Mondays: Rijkswaterstaat publishes a new edition about once a month
+    - cron: '17 5 * * 1'
+
+permissions:
+  contents: write
+
+env:
+  REGION_ID: nl-inland
+  REGION_NAME: 'Nederland (excl. Zeeland, Waddenzee)'
+  LIST_URL: 'https://www.vaarweginformatie.nl/frp/api/webcontent/downloads?pageId=infra/enc'
+  IMAGE: ghcr.io/gjvanhalem/opensail-enc-pipeline:latest
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Pick the file id
+        id: source
+        env:
+          FILE_ID: ${{ inputs.file_id }}
+          FORCE: ${{ inputs.force }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "$FILE_ID" ]; then
+            # File ids change with every edition, so read the current one from the list
+            FILE_ID=$(curl -fsSL "$LIST_URL" | jq -r '[.[] | select(.name | startswith("Nederland (excl"))] | sort_by(-.date) | .[0].fileId')
+          fi
+          [[ "$FILE_ID" =~ ^[0-9]+$ ]] || { echo "No file id found"; exit 1; }
+          echo "file_id=$FILE_ID" >> "$GITHUB_OUTPUT"
+          # Skip when the newest release already holds this edition
+          BUILT=$(curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/$REGION_ID.json" 2>/dev/null | jq -r '.source.fileId // empty' || true)
+          if [ "$BUILT" = "$FILE_ID" ] && [ "$FORCE" != "true" ]; then
+            echo "Newest release is already built from file $FILE_ID"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        if: steps.source.outputs.skip != 'true'
+        run: |
+          mkdir -p out
+          docker run --rm -v "$PWD/out:/work/out" "$IMAGE" "$REGION_ID" "${{ steps.source.outputs.file_id }}" "$REGION_NAME"
+          ls -l out
+          jq . out/index.json
+
+      - name: Publish
+        if: steps.source.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          EDITION=$(jq -r '.editionDate // "unknown"' "out/$REGION_ID.json")
+          TAG="$REGION_ID-$EDITION-${{ github.run_number }}"
+          cat > notes.md <<EOF
+          Rijkswaterstaat inland ENC, edition $EDITION (download file ${{ steps.source.outputs.file_id }}), as PMTiles for OpenSail.
+
+          Source: Rijkswaterstaat, CC0-1.0. Not for navigation.
+          EOF
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$REGION_NAME, edition $EDITION" \
+            --notes-file notes.md --latest \
+            "out/$REGION_ID.pmtiles" "out/$REGION_ID.json" out/index.json
+
+      - name: Check the download
+        if: steps.source.outputs.skip != 'true'
+        run: |
+          BASE="https://github.com/$GITHUB_REPOSITORY/releases/latest/download"
+          curl -fsSL "$BASE/index.json" | jq -e '.regions[0].file' > /dev/null
+          # PMTiles reads the archive with byte ranges: the header is the first 127 bytes
+          curl -fsSL -r 0-126 -o header.bin "$BASE/$REGION_ID.pmtiles"
+          [ "$(stat -c %s header.bin)" = 127 ] && head -c 7 header.bin | grep -q PMTiles
+          echo "index.json and a byte range of $REGION_ID.pmtiles download fine"
